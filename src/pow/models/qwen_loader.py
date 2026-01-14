@@ -15,7 +15,7 @@ from common.logger import create_logger
 logger = create_logger(__name__)
 
 # Model name from environment or default
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-32B-FP8")
+MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen3-235B-A22B-Instruct-2507-FP8")
 
 # Default k_dim for artifacts (first k dimensions of normalized logits)
 K_DIM = int(os.getenv("K_DIM", "12"))

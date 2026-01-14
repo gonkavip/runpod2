@@ -19,7 +19,7 @@ ENV PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 
 # PoC v2 settings
 ENV POC_VERSION=v2
-ENV MODEL_NAME=Qwen/Qwen3-32B-FP8
+ENV MODEL_NAME=Qwen/Qwen3-235B-A22B-Instruct-2507-FP8
 ENV K_DIM=12
 
 # HuggingFace cache location (RunPod caches models here)
