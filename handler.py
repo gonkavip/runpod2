@@ -336,15 +336,8 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
     logger.info(f"  GPU Count: {gpu_count}")
     logger.info("=" * 60)
 
-    # Check vLLM health
-    logger.info("Checking vLLM health...")
-    if not vllm_client.health_check():
-        yield {"error": "vLLM server not healthy", "error_type": "ServerError", "fatal": True}
-        return
-
-    yield {"status": "vllm_ready", "worker_id": worker_id, "poc_version": "v2"}
-
-    # Connect to orchestrator
+    # Connect to orchestrator FIRST (before waiting for vLLM)
+    # This allows us to receive shutdown commands during model loading
     logger.info("Connecting to orchestrator...")
     try:
         response = requests.post(
@@ -371,6 +364,45 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
         yield {"error": f"Connection failed: {e}", "error_type": "ConnectionError", "fatal": True}
         return
 
+    # Wait for vLLM to be ready while polling orchestrator for shutdown
+    logger.info("Waiting for vLLM health while polling orchestrator for commands...")
+    vllm_wait_start = time.time()
+    vllm_max_wait = 1200  # 20 minutes (model loading can take a while)
+    vllm_ready = False
+
+    while time.time() - vllm_wait_start < vllm_max_wait:
+        # Check for shutdown from orchestrator (every iteration)
+        try:
+            response = requests.get(
+                f"{orchestrator_url}/api/workers/{worker_id}/config",
+                timeout=5,
+            )
+            if response.status_code == 200:
+                cmd = response.json()
+                if cmd and cmd.get("type") == "shutdown":
+                    logger.info("Received shutdown command during vLLM loading - exiting")
+                    yield {"status": "shutdown", "reason": "orchestrator_shutdown_during_loading"}
+                    return
+        except Exception:
+            pass  # Orchestrator might be temporarily unavailable
+
+        # Check vLLM health
+        if vllm_client.health_check():
+            vllm_ready = True
+            elapsed = int(time.time() - vllm_wait_start)
+            logger.info(f"vLLM is healthy after {elapsed}s")
+            break
+
+        time.sleep(2)
+
+    if not vllm_ready:
+        elapsed = int(time.time() - vllm_wait_start)
+        logger.error(f"vLLM not ready after {elapsed}s")
+        yield {"error": f"vLLM not ready after {elapsed}s", "error_type": "ServerError", "fatal": True}
+        return
+
+    yield {"status": "vllm_ready", "worker_id": worker_id, "poc_version": "v2"}
+
     # Poll for config (block_hash) - wait up to 10 minutes
     logger.info("Waiting for block_hash from orchestrator (max 10 minutes)...")
     poll_start = time.time()
@@ -395,7 +427,7 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
                         break
 
                 elif config and config.get("type") == "shutdown":
-                    logger.info("Received shutdown command while waiting")
+                    logger.info("Received shutdown command while waiting for config")
                     yield {"status": "shutdown", "reason": "orchestrator_command"}
                     return
 
@@ -416,6 +448,22 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
         "block_height": block_height,
     }
 
+    # Check for shutdown before proceeding to /ready
+    # (session may have been cancelled while we were waiting for config)
+    try:
+        response = requests.get(
+            f"{orchestrator_url}/api/workers/{worker_id}/config",
+            timeout=10,
+        )
+        if response.status_code == 200:
+            cmd = response.json()
+            if cmd and cmd.get("type") == "shutdown":
+                logger.info("Received shutdown command before ready - session cancelled")
+                yield {"status": "shutdown", "reason": "session_cancelled_before_ready"}
+                return
+    except Exception:
+        pass
+
     # Model already loaded (vLLM warmup), notify ready
     logger.info("Notifying orchestrator: ready for job assignment")
     try:
@@ -424,6 +472,13 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
             json={"gpu_count": gpu_count},
             timeout=30,
         )
+
+        # Worker not found (404) means session was cleared - shutdown
+        if response.status_code == 404:
+            logger.info("Worker not found (session ended) - shutting down")
+            yield {"status": "shutdown", "reason": "worker_not_found"}
+            return
+
         response.raise_for_status()
         ready_data = response.json()
         logger.info(f"Ready response: {ready_data}")
@@ -447,6 +502,10 @@ def pooled_handler_v2(input_data: Dict) -> Generator[Dict, None, None]:
             yield {"error": "No public_key in ready response", "error_type": "ConfigError", "fatal": True}
             return
 
+    except requests.exceptions.HTTPError as e:
+        logger.error(f"Ready notification failed: {e}")
+        yield {"error": f"Ready notification failed: {e}", "error_type": "ReadyError", "fatal": True}
+        return
     except Exception as e:
         logger.error(f"Ready notification failed: {e}")
         yield {"error": f"Ready notification failed: {e}", "error_type": "ReadyError", "fatal": True}
@@ -621,20 +680,9 @@ if __name__ == "__main__":
     logger.info(f"Model: {MODEL_NAME}")
     logger.info(f"K_DIM: {K_DIM}, SEQ_LEN: {SEQ_LEN}")
 
-    # Wait for vLLM to be ready
-    logger.info("Checking vLLM health...")
-    max_wait = 60
-    start = time.time()
-
-    while time.time() - start < max_wait:
-        if vllm_client.health_check():
-            logger.info("vLLM is healthy!")
-            break
-        time.sleep(2)
-    else:
-        logger.error(f"vLLM not ready after {max_wait}s")
-        # Continue anyway - vLLM might become ready later
-
-    # Start RunPod serverless worker
-    logger.info("Starting RunPod serverless worker...")
+    # Start RunPod serverless worker immediately
+    # vLLM health check is done inside pooled_handler_v2 while polling
+    # orchestrator for shutdown commands, so the worker can be stopped
+    # even during model loading
+    logger.info("Starting RunPod serverless worker (vLLM may still be loading)...")
     runpod.serverless.start({"handler": handler})

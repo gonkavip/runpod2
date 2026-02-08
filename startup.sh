@@ -43,50 +43,10 @@ echo "Host: ${VLLM_HOST}"
 VLLM_PID=$!
 echo "vLLM started with PID: ${VLLM_PID}"
 
-# Wait for vLLM to be ready
-echo ""
-echo "=== Waiting for vLLM to be ready ==="
-MAX_WAIT=1200  # 20 minutes for large model
-WAIT_INTERVAL=5
-ELAPSED=0
-
-while [ $ELAPSED -lt $MAX_WAIT ]; do
-    # Check if vLLM is still running
-    if ! kill -0 $VLLM_PID 2>/dev/null; then
-        echo "ERROR: vLLM process died"
-        echo "=== vLLM logs ==="
-        tail -100 /tmp/vllm.log
-        exit 1
-    fi
-
-    # Check health endpoint
-    if curl -s "http://${VLLM_HOST}:${VLLM_PORT}/health" >/dev/null 2>&1; then
-        echo "vLLM is healthy after ${ELAPSED}s"
-        break
-    fi
-
-    echo "Waiting for vLLM... (${ELAPSED}s/${MAX_WAIT}s)"
-    sleep $WAIT_INTERVAL
-    ELAPSED=$((ELAPSED + WAIT_INTERVAL))
-done
-
-if [ $ELAPSED -ge $MAX_WAIT ]; then
-    echo "ERROR: vLLM failed to start within ${MAX_WAIT}s"
-    echo "=== vLLM logs ==="
-    tail -100 /tmp/vllm.log
-    exit 1
-fi
-
-# Verify PoC endpoints are available
-echo ""
-echo "=== Verifying PoC endpoints ==="
-if curl -s "http://${VLLM_HOST}:${VLLM_PORT}/api/v1/pow/status" >/dev/null 2>&1; then
-    echo "PoC endpoints available"
-else
-    echo "WARNING: PoC endpoints may not be available (this might be normal before first init)"
-fi
-
-# Start RunPod handler
+# Start RunPod handler immediately (handler.py will wait for vLLM health
+# while polling orchestrator for shutdown commands, so the worker can be
+# stopped even during model loading)
 echo ""
 echo "=== Starting RunPod Handler ==="
+echo "Handler will wait for vLLM readiness while polling orchestrator"
 exec /usr/bin/python3.12 /app/handler.py
